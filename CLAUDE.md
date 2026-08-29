@@ -14,21 +14,43 @@ iPhone --AirPlay/RAOP--> [ sonospoof ] --HTTP stream--> Sonos
 Develop on `claude/airplay-sonos-proxmox-app-yk8clo`. Do not open a PR unless
 asked.
 
-## State: M0 complete (2026-08-29)
+## State: M1 works end to end (2026-08-29)
 
-Both probes have now been run against real hardware on George's LAN. Every M0
-question is answered; see "M0 findings" below. `internal/raop` exists and is
-real M1 code with tests — the probes under `cmd/` are still throwaway and
-should be deleted when M1 lands, but do not delete `internal/`.
+`cmd/sonospoof` advertises every discovered zone as its own AirPlay target and
+plays what the phone sends. Verified on the three Play:1 units, with both an
+iPhone and a Mac as sender.
 
-- `cmd/spike-sonos` — SSDP discovery, topology, push a URL to a zone. Now also
-  has `-hosts` (skip SSDP, name players directly) and `-src` (pin the egress
-  interface). Verified against three Play:1 units.
-- `cmd/spike-raop` — `_raop._tcp` advertisement plus RTSP dumper. Now answers
-  the Apple-Challenge via `internal/raop`, which is what got us a real
-  ANNOUNCE. An iPhone connects and plays to it.
-- `internal/raop` — the embedded AirPort Express key, the Apple-Response, and
-  session key/IV unwrapping. 7 tests, all against captured real values.
+```
+cmd/sonospoof     the daemon
+internal/raop     RTSP, the Apple-Challenge, SDP, RTP + AES
+internal/alac     ALAC decoder, byte-identical to Apple's reference
+internal/audio    ring buffer and the endless WAV writer
+internal/sonos    discovery, topology, transport control
+internal/bridge   joins one receiver to one zone
+```
+
+Multi-zone was pulled forward from M2. Each zone has its own advertisement,
+receiver, ALAC decoder and ring, and nothing is shared between them — the
+decoder carries adaptive predictor state, so sharing one would cross the
+streams.
+
+**One target per Sonos *group*, not per speaker.** Grouped speakers physically
+cannot play different streams: the coordinator drives the group and transport
+commands to a member are silently ignored. `sonos.Zones` therefore collapses a
+group into a single target rather than offering independence the hardware will
+not honour. Zones are keyed by coordinator UUID, never by group ID — those
+disagree in practice, e.g. Garage's group is
+`RINCON_5CAAFD292DE601400:3104264951`, carrying Austin Bedroom's UUID from some
+past grouping.
+
+Each zone's AirPlay identity is the coordinator's own MAC, which the Sonos UUID
+embeds (`RINCON_B8E937EFDE14_01400`). That is unique, stable across restarts and
+DHCP, and independent of the one NIC the daemon runs on — which matters because
+one host now advertises several targets, and macOS was seen rotating its MAC
+per VLAN.
+
+The M0 probes under `cmd/` are throwaway and are now superseded; delete them.
+Do not delete `internal/`.
 
 ## M0 findings
 
@@ -74,18 +96,22 @@ The ALAC params are exactly as predicted. Post-RECORD the phone sends
 RTP timestamps, `application/x-dmap-tagged` metadata and `image/jpeg` artwork
 — M3 material, but it arrives whether or not we want it yet.
 
-## Next action: M1
+## Next action: M2
 
-Single hardcoded zone, WAV out, end to end. The handshake is solved; what
-remains is the audio path.
+1. **Delete the M0 spikes.** `cmd/spike-sonos` and `cmd/spike-raop` are not on
+   the daemon's path and have served their purpose.
+2. **React to topology changes.** Grouping is read once at startup, so grouping
+   or ungrouping from the Sonos app leaves a target that silently does nothing.
+3. **Yield the speaker.** Subscribe to Sonos GENA events so taking a zone from
+   the Sonos app drops the AirPlay session instead of fighting over it.
+4. **RTP retransmits.** Nothing currently requests a resend, so every Wi-Fi
+   hiccup is a dropout. The control port is bound and read but only parsed far
+   enough to ignore.
+5. Config file, systemd unit, `pct` install script.
 
-1. Bind the three UDP ports and return the real ones from SETUP. The client's
-   `timing_port` and `control_port` come in on the SETUP `Transport:` header.
-2. AES-128-CBC decrypt each RTP payload with `raop.SessionKey`/`SessionIV`.
-   Note the trailing partial block is left in the clear — do not pad it.
-3. ALAC decode against the `a=fmtp:96` config above.
-4. Ring buffer, then the WAV writer feeding the Sonos over plain `http://`.
-5. Feed digital silence when AirPlay pauses; never let the stream run dry.
+Unverified: `raop.VolumeToSonos` maps −30…0 dB onto 0–100 with −144 as mute,
+which is a judgement call rather than something measured. Group collapse has
+unit tests but has not been exercised against a real grouping.
 
 ## Decided — do not re-litigate
 
@@ -121,6 +147,20 @@ Each of these was reasoned out during design; they are not speculative.
   a group are silently ignored. Topology awareness belongs in M2, not "polish".
 - **Never let the stream run dry.** If bytes stop while AirPlay is paused, Sonos
   tears the stream down and takes seconds to recover. Feed digital silence.
+- **But do not pad silence eagerly either.** This is the sharp edge of the rule
+  above and it cost a debugging round. Sonos buffers several seconds and will
+  accept bytes far faster than 44.1kHz while that buffer fills, so a reader
+  that pads the instant the ring is momentarily empty outruns the sender and
+  splices silence between every real chunk. That is audible as continuous
+  glitching, not as a gap, and it self-corrects once backpressure kicks in —
+  so it presents as "the first few seconds are broken". `Ring.Read` waits
+  `SilenceAfter` before padding, and playback is primed before the speaker is
+  told to fetch.
+- **Diagnostics must reset per session.** The underrun counter originally
+  spanned the process lifetime, which made a working stream look like it had
+  never received a single sample and sent the first investigation to entirely
+  the wrong layer. A statistic that silently spans sessions is worse than no
+  statistic.
 - **Unique URL per session** (nonce), or Sonos caches and refuses to reopen.
 - **Clock drift.** The phone's 44.1 kHz is not the speaker's. TCP backpressure
   covers most of it; an elastic buffer handles the rest by dropping or
