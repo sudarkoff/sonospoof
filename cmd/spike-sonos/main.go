@@ -17,6 +17,15 @@
 //	spike-sonos -play <url> -zone "Kitchen"      # push a stream to one zone
 //	spike-sonos -play <url> -zone "Kitchen" -raw # ...as plain http://
 //	spike-sonos -stop -zone "Kitchen"
+//
+//	spike-sonos -hosts 192.168.30.252,192.168.30.244   # skip SSDP entirely
+//	spike-sonos -src 192.168.20.20                     # pin the egress iface
+//
+// -hosts exists because SSDP is link-scoped: it does not cross a VLAN
+// boundary, and no consumer router reflects it (UniFi reflects mDNS only).
+// When the speakers and this host are on different subnets, M-SEARCH is
+// simply never answered while unicast HTTP to port 1400 works fine, so
+// naming the players directly is the only way to reach them.
 package main
 
 import (
@@ -55,20 +64,33 @@ func main() {
 		raw      = flag.Bool("raw", false, "use plain http:// instead of x-rincon-mp3radio://")
 		stop     = flag.Bool("stop", false, "send Stop to the target zone")
 		waitFor  = flag.Duration("wait", 3*time.Second, "how long to listen for SSDP replies")
+		hosts    = flag.String("hosts", "", "comma-separated ZonePlayer IPs; skips SSDP discovery")
+		srcIP    = flag.String("src", "", "local IP to send SSDP from, to pin the egress interface")
 	)
 	flag.Parse()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	players, err := discover(ctx, *waitFor)
-	if err != nil {
-		log.Fatalf("discovery failed: %v", err)
+	var players []player
+	var err error
+	if *hosts != "" {
+		players = describeAll(ctx, strings.Split(*hosts, ","))
+	} else {
+		players, err = discover(ctx, *waitFor, *srcIP)
+		if err != nil {
+			log.Fatalf("discovery failed: %v", err)
+		}
 	}
 	if len(players) == 0 {
 		log.Fatalf("no ZonePlayers found.\n" +
-			"If this box is an LXC/VM, confirm it is bridged onto the same L2 as the\n" +
-			"speakers -- SSDP is multicast and does not survive NAT or docker bridges.")
+			"SSDP is link-scoped multicast: it does not cross a VLAN boundary and is\n" +
+			"not reflected by consumer routers the way mDNS is. If the speakers sit on\n" +
+			"a different subnet than this host, M-SEARCH will never be answered even\n" +
+			"though unicast HTTP to port 1400 works. Find them with\n" +
+			"  dns-sd -B _sonos._tcp        (macOS)\n" +
+			"  avahi-browse -rt _sonos._tcp (Linux)\n" +
+			"and pass the addresses with -hosts, or put this host on the speakers' VLAN.")
 	}
 
 	fmt.Printf("\n=== Discovered %d ZonePlayer(s) ===\n", len(players))
@@ -133,9 +155,30 @@ type player struct {
 	UDN       string
 }
 
+// describeAll fetches the device description for each explicitly named host.
+// This is the path that works across a subnet boundary, where SSDP cannot go.
+func describeAll(ctx context.Context, ips []string) []player {
+	var players []player
+	for _, ip := range ips {
+		ip = strings.TrimSpace(ip)
+		if ip == "" {
+			continue
+		}
+		p, err := describe(ctx, ip)
+		if err != nil {
+			log.Printf("  %s: description fetch failed: %v", ip, err)
+			continue
+		}
+		players = append(players, p)
+	}
+	return players
+}
+
 // discover runs an SSDP M-SEARCH for ZonePlayers and describes each responder.
-func discover(ctx context.Context, wait time.Duration) ([]player, error) {
-	conn, err := net.ListenPacket("udp4", ":0")
+// src, when set, is the local address to bind to; on a multi-homed host that
+// is what decides which interface the multicast actually leaves by.
+func discover(ctx context.Context, wait time.Duration, src string) ([]player, error) {
+	conn, err := net.ListenPacket("udp4", net.JoinHostPort(src, "0"))
 	if err != nil {
 		return nil, err
 	}
