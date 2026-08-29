@@ -1,0 +1,46 @@
+[Unit]
+Description=AirPlay bridge for first-generation Sonos speakers
+Documentation=https://github.com/sudarkoff/sonospoof
+# The daemon discovers speakers over SSDP at startup and needs the network to
+# be genuinely up, not merely configured.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sonospoof -iface eth0
+Restart=always
+RestartSec=5
+
+# Discovery is read once at startup, so a restart is how the daemon picks up
+# a speaker that was added, renamed or regrouped. Restarting is cheap: an
+# idle session is just an advertisement.
+User=sonospoof
+Group=sonospoof
+
+# Hardening is limited to what works inside an unprivileged LXC.
+#
+# Every mount-namespace directive -- ProtectSystem, PrivateTmp, PrivateDevices,
+# ProtectHome, ProtectKernelTunables, ProtectControlGroups -- fails there with
+# "Failed to set up mount namespacing: /run/systemd/unit-root/proc: Permission
+# denied" and takes the service down with status 226/NAMESPACE. The container
+# itself already provides that isolation, so what remains here are the
+# seccomp- and capability-based restrictions, which do apply.
+NoNewPrivileges=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# AF_NETLINK is required: the mDNS library watches for link changes so it can
+# re-announce when the interface comes back. Without it the daemon still runs
+# but stops re-advertising after a network blip.
+#
+# No capabilities are needed at all: every port the daemon binds is ephemeral
+# or above 1024 (mDNS is 5353), and it writes nothing.
+
+[Install]
+WantedBy=multi-user.target
