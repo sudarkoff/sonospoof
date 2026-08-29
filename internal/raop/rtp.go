@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/sudarkoff/sonospoof/internal/alac"
 	"github.com/sudarkoff/sonospoof/internal/audio"
@@ -29,6 +30,14 @@ var errShortPacket = errors.New("raop: packet shorter than an RTP header")
 // One per session: it owns an ALAC decoder, which carries adaptive predictor
 // state and scratch buffers and must not be shared between streams.
 type AudioDecoder struct {
+	// mu serialises everything below. SETUP starts a reader goroutine for the
+	// audio port and another for the control port, and both deliver packets
+	// here -- the control port carries retransmit responses, which are audio.
+	// Without this they race the resequencer's map, the ALAC decoder's
+	// adaptive state and the shared pcm buffer, which corrupts audio and can
+	// panic on concurrent map write.
+	mu sync.Mutex
+
 	block cipher.Block
 	iv    []byte
 	dec   *alac.Decoder
@@ -45,6 +54,8 @@ type AudioDecoder struct {
 
 // Stats reports what the network did to this session.
 func (a *AudioDecoder) Stats() (packets, reordered, lost, late, errs uint64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	return a.Packets, a.queue.Reordered, a.queue.Lost, a.queue.Late, a.Errors
 }
 
@@ -75,6 +86,10 @@ func (a *AudioDecoder) Packet(pkt []byte) error {
 	if len(pkt) < rtpHeaderLen {
 		return errShortPacket
 	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
 	a.Packets++
 
 	pt := pkt[1] & 0x7f
