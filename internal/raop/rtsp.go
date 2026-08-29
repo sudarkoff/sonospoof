@@ -395,10 +395,20 @@ func (r *Receiver) closeIfOwner(conn net.Conn) {
 func (r *Receiver) teardown() {
 	r.mu.Lock()
 	wasRunning := r.running
+	dec := r.dec
 	r.running = false
 	r.dec = nil
 	r.owner = nil
 	r.mu.Unlock()
+
+	// Report what the network did, so a glitchy session can be attributed
+	// rather than guessed at. Reordering that was repaired is harmless; loss
+	// is what is actually audible.
+	if wasRunning && dec != nil {
+		packets, reordered, lost, late, errs := dec.Stats()
+		r.logf("%s: %d packets, %d reordered, %d lost, %d late, %d decode errors",
+			r.Name, packets, reordered, lost, late, errs)
+	}
 
 	r.closeUDP()
 	r.Ring.Reset()

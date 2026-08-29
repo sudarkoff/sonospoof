@@ -33,6 +33,7 @@ type AudioDecoder struct {
 	iv    []byte
 	dec   *alac.Decoder
 	ring  *audio.Ring
+	queue *resequencer
 
 	pcm []int16
 
@@ -40,6 +41,11 @@ type AudioDecoder struct {
 	Packets   uint64
 	Decrypted uint64
 	Errors    uint64
+}
+
+// Stats reports what the network did to this session.
+func (a *AudioDecoder) Stats() (packets, reordered, lost, late, errs uint64) {
+	return a.Packets, a.queue.Reordered, a.queue.Lost, a.queue.Late, a.Errors
 }
 
 // NewAudioDecoder builds the audio path for one session from the session key
@@ -57,6 +63,7 @@ func NewAudioDecoder(key, iv []byte, cfg alac.Config, ring *audio.Ring) (*AudioD
 		iv:    append([]byte(nil), iv...),
 		dec:   alac.NewDecoder(cfg),
 		ring:  ring,
+		queue: newResequencer(),
 		pcm:   make([]int16, int(cfg.FrameLength)*int(cfg.NumChannels)),
 	}, nil
 }
@@ -105,12 +112,30 @@ func Timestamp(pkt []byte) uint32 {
 	return binary.BigEndian.Uint32(pkt[4:8])
 }
 
+// audio queues one packet by sequence number and decodes whatever that makes
+// ready, in order.
 func (a *AudioDecoder) audio(pkt []byte) error {
-	payload := pkt[rtpHeaderLen:]
-	if len(payload) == 0 {
+	if len(pkt) <= rtpHeaderLen {
 		return nil
 	}
 
+	// The packet must be copied: the reader reuses its receive buffer, and the
+	// resequencer can hold a packet across many subsequent reads. Without this
+	// a held packet would be silently overwritten by later traffic and decode
+	// as someone else's audio.
+	payload := make([]byte, len(pkt)-rtpHeaderLen)
+	copy(payload, pkt[rtpHeaderLen:])
+
+	var firstErr error
+	for _, p := range a.queue.push(SeqNo(pkt), payload) {
+		if err := a.decodeOne(p); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func (a *AudioDecoder) decodeOne(payload []byte) error {
 	plain := a.decrypt(payload)
 
 	n, err := a.dec.Decode(plain, a.pcm)
