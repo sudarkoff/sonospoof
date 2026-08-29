@@ -14,6 +14,10 @@ iPhone --AirPlay/RAOP--> [ sonospoof ] --HTTP stream--> Sonos
                               +--SOAP SetAVTransportURI--> Sonos
 ```
 
+Every discovered zone appears as its own AirPlay target and can be streamed to
+independently. Verified against three Play:1 units with both an iPhone and a
+Mac as sender.
+
 ## Expect 2–4 seconds of latency
 
 AirPlay 1 buffers about two seconds by design, and Sonos adds its own buffer on
@@ -21,109 +25,131 @@ HTTP streams that cannot be turned off. This is fine for music and useless for
 video — lip-sync is not achievable on this architecture. That is a property of
 the approach, not a bug to be filed.
 
-## Status
-
-Milestone 0: two throwaway probes that de-risk each half independently. No
-daemon yet.
-
-## Probes
-
-Both are reconnaissance tools under `cmd/`, not part of the eventual daemon.
-
-### `spike-sonos` — the Sonos half
-
-Discovers ZonePlayers over SSDP, dumps the zone-group topology (marking each
-group's coordinator), and optionally pushes a stream URL to one zone.
+## Running it
 
 ```sh
-go run ./cmd/spike-sonos
-go run ./cmd/spike-sonos -play http://stream.example/radio.mp3 -zone "Kitchen"
-go run ./cmd/spike-sonos -play http://stream.example/radio.mp3 -zone "Kitchen" -raw
-go run ./cmd/spike-sonos -stop -zone "Kitchen"
+go build ./cmd/sonospoof
+./sonospoof                      # every discovered zone
+./sonospoof -zone Garage         # just one
+./sonospoof -hosts 192.168.1.50  # skip SSDP, name the players directly
+./sonospoof -dump /tmp/dump      # tee served PCM to .wav, for diagnosing audio
 ```
 
-`-raw` sends a plain `http://` URI instead of `x-rincon-mp3radio://`. The latter
-marks the stream endless and non-seekable; comparing the two is the point.
+### The network requirement, which is not optional
 
-### `spike-raop` — the Apple half
+**The daemon must be on the same subnet as the speakers.** Two separate things
+break otherwise, and only one of them is obvious:
 
-Advertises a fake AirPlay 1 receiver over mDNS and dumps every byte of the RTSP
-conversation that follows. It answers just enough to keep a client progressing;
-it does not implement the handshake.
+1. SSDP discovery is link-scoped multicast. It does not cross a VLAN and is not
+   reflected the way mDNS is, so nothing is discovered at all.
+2. Far worse, the speaker has to open a TCP connection *back* to the daemon to
+   fetch its audio. A segmented network typically permits the outbound
+   direction only, so `SetAVTransportURI` succeeds, the track title appears in
+   the Sonos app, and no sound ever comes out. That failure looks like a bug in
+   this program and is not one.
+
+The phone does not need to be on that subnet: mDNS reflection carries the
+advertisement, and the phone opens its connections inbound.
+
+## Deployment
+
+`deploy/` builds a static Linux binary and provisions an unprivileged Proxmox
+LXC on the speakers' VLAN:
 
 ```sh
-go run ./cmd/spike-raop -name "Kitchen (spoof)" -iface eth0
+deploy/build.sh
+scp dist/* pve:/tmp/
+ssh pve 'bash /tmp/install-lxc.sh'      # override CTID, VLAN, IPV4, ...
+deploy/update.sh                        # push a rebuilt binary later
 ```
 
-Then pick the device from the AirPlay menu on an iPhone or Mac. What to watch
-for in the dump:
+The installer removes `avahi-daemon` if the template carries it — the daemon
+has its own mDNS responder, and two responders on one host is a flake factory.
 
-- An `Apple-Challenge` header on `OPTIONS` means the client chose **legacy RSA**,
-  which is answerable with the long-leaked AirPort Express key. This is the good
-  case.
-- A `POST /fp-setup` means it chose **FairPlay** instead, a much bigger fight.
-  Bisect the mDNS TXT records with `-et` and `-cn` until it stops doing that.
-- The `ANNOUNCE` SDP is the prize. Its `a=fmtp:` line carries the ALAC frame
-  configuration the real decoder gets written against, and `a=rsaaeskey`/`a=aesiv`
-  carry the wrapped AES key for the audio stream.
+## How it fits together
 
-## Design decisions so far
+```
+cmd/sonospoof     the daemon
+internal/raop     RTSP, the Apple-Challenge, SDP, RTP + AES, resends
+internal/alac     ALAC decoder, byte-identical to Apple's reference
+internal/audio    ring buffer and the endless WAV writer
+internal/sonos    discovery, topology, transport control
+internal/bridge   joins one receiver to one zone
+```
 
-**Go.** Single static binary, trivial systemd unit, no runtime dependencies
-inside a container. The one gap is ALAC decoding; Apple open-sourced the
-reference decoder under Apache 2.0, so that is a mechanical port rather than
-reverse engineering.
+**One target per Sonos *group*, not per speaker.** Grouped speakers physically
+cannot play different streams — the coordinator drives the group and transport
+commands to a member are silently ignored — so a group is collapsed into a
+single target rather than offering independence the hardware will not honour.
 
-**AirPlay 1 (RAOP) first, with a clean seam for AirPlay 2.** AP1 is documented
-and still works against current iOS. AP2 means HomeKit pairing and buffered
-audio mode — better sync and native multi-room grouping, but far more protocol
-work before any sound comes out. The receiver lives behind an interface so it
-can be swapped later.
-
-**WAV on the wire to the speaker, at least at first.** A RIFF header with a
-bogus giant size, streamed forever. No encoder code, lossless, no added latency,
-about 1.4 Mbps. FLAC comes later as the default (halves the bandwidth, still
-lossless); MP3 stays available as a fallback for unhappy zones.
-
-**One AirPlay target per Sonos zone.** Each zone gets its own `_raop._tcp`
-advertisement and its own pipeline.
-
-**Our own mDNS responder, no Avahi dependency.** Two responders on one host is a
-flake factory.
-
-## Deployment shape
-
-An unprivileged Proxmox LXC bridged onto `vmbr0` with a real LAN IP.
-
-mDNS and SSDP are multicast and do not survive NAT or bridge networking. The
-container must be on the same L2 segment as both the speakers and the phone. If
-you run this under Docker instead, it must be `network_mode: host` or macvlan —
-default bridge networking breaks discovery silently, which is a miserable thing
-to debug.
+Each zone's AirPlay identity is the coordinator's own MAC, which its Sonos UUID
+embeds (`RINCON_B8E937EFDE14_01400`). Unique, stable across restarts and DHCP,
+and independent of whatever NIC the daemon runs on.
 
 ## Known hazards
 
-Collected here so they are not rediscovered the hard way:
+Collected here so they are not rediscovered the hard way. Several of these were
+learned expensively.
 
 - **Group coordinators.** Transport commands sent to a non-coordinator member of
   a group are silently ignored. Topology awareness is load-bearing, not polish.
-- **Never let the stream run dry.** If bytes stop while AirPlay is paused, Sonos
-  tears the stream down and takes seconds to recover. Feed digital silence.
+- **Never let the stream run dry — and that means the *rate*, not just the
+  connection.** The writer emits one chunk per iteration, so pacing with a
+  timeout delivers `chunk/timeout` and is below realtime by construction. A 2s
+  timeout on 100ms chunks delivers 5%; the speaker drains its buffer and falls
+  silent while still reporting that it is playing. Each chunk is tied to an
+  absolute deadline instead.
+- **A buffer can only be established at startup.** Exact pacing preserves depth
+  but cannot create it: supply equals demand, so a ring that starts empty stays
+  empty and every jitter spike becomes a gap. The stream opens with silence
+  while the ring fills behind it.
 - **Unique URL per session.** Add a nonce, or Sonos caches and refuses to reopen.
-- **Clock drift.** The phone's 44.1 kHz is not the speaker's 44.1 kHz. TCP
-  backpressure handles most of it; an elastic buffer covers the rest by dropping
-  or duplicating a frame when it drifts out of band.
-- **RTP retransmits.** RAOP has a resend-request mechanism on the control port.
-  Skip it and every Wi-Fi hiccup becomes an audible dropout.
+- **RTP resends.** Request them the moment a gap appears, not when the reorder
+  window expires — a resend only helps if it lands before you skip forward.
+- **The reorder window must be shorter than the reserve**, or waiting for a
+  resend empties the ring and forces the gap the resend was meant to avoid.
+- **Two UDP readers feed one decoder.** SETUP starts a reader for the audio port
+  and another for the control port, and the control port carries resend
+  responses, which are audio. Anything reachable from the packet path must be
+  serialised. Run the tests with `-race`.
 - **Volume is a curve, not a rescale.** AirPlay sends −144.0…0.0 dB; Sonos wants
   0–100 linear.
 - **Yield the speaker.** Subscribe to Sonos GENA events so that when someone
   takes the zone from the Sonos app, the AirPlay session drops instead of
-  fighting over it.
+  fighting over it. Not yet implemented.
 
-## Prior art
+## How this differs from AirConnect
 
-[AirConnect](https://github.com/philippe44/AirConnect) already does this and
-works today; if you want music in the kitchen tonight, use it. `shairport-sync`
-is the reference for the RAOP receiver end. This project is a from-scratch
-implementation that borrows their hard-won protocol knowledge.
+[AirConnect](https://github.com/philippe44/AirConnect) solves the same problem
+and has solved it for years. It is the honest recommendation if you want music
+playing tonight, and this project borrows its hard-won protocol knowledge
+freely — the startup silence fill, in particular, is its idea and is what
+finally made playback clean here.
+
+Where AirConnect is straightforwardly ahead: it is mature and handles edge
+cases this does not; it targets any UPnP renderer plus Chromecast, not just
+Sonos; it implements the RTP timing and sync protocol properly, computing each
+frame's playtime from the sender's clock rather than pacing to a local
+deadline; and it offers output format choices where this only emits WAV.
+
+What this does that AirConnect does not is know it is talking to Sonos:
+
+- **Zone groups.** Grouped Sonos speakers physically cannot play different
+  streams — the coordinator drives the group and transport commands to a member
+  are silently ignored. AirConnect treats each renderer independently, so it
+  will offer you targets that the hardware cannot honour. `sonospoof` reads the
+  zone topology and collapses a group into a single target addressed at its
+  coordinator.
+- **Stable identity from the hardware.** Each target's AirPlay id is the
+  coordinator's own MAC, which its Sonos UUID embeds. Unique per zone, stable
+  across restarts and DHCP leases, and independent of the host's NIC — which
+  matters when one host advertises several targets.
+- **A single static binary** with no runtime dependencies, which is convenient
+  in a container and is most of why Go was chosen.
+
+If you have Sonos and use grouping, the topology awareness is the reason to
+prefer this. Otherwise AirConnect is the more complete program.
+
+`shairport-sync` is the other reference worth reading for the RAOP receiver
+end, and Apple's ALAC decoder is Apache 2.0, so `internal/alac` is a mechanical
+port of it rather than reverse engineering.

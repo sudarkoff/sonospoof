@@ -32,8 +32,6 @@ go.work.sum
 # .vscode/
 
 # Local build output
-/spike-sonos
-/spike-raop
 /sonospoof
 
 # Build output for LXC deployment

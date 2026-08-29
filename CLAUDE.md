@@ -49,8 +49,11 @@ DHCP, and independent of the one NIC the daemon runs on — which matters becaus
 one host now advertises several targets, and macOS was seen rotating its MAC
 per VLAN.
 
-The M0 probes under `cmd/` are throwaway and are now superseded; delete them.
-Do not delete `internal/`.
+The M0 probes are gone — deleted once M1 landed, as planned.
+
+Deployed and running: unprivileged Proxmox LXC 310 (`sonospoof`) on the IoT
+VLAN. See `deploy/`. Playback is clean: three minutes with zero gaps, verified
+by capturing the served PCM, not by ear alone.
 
 ## M0 findings
 
@@ -98,21 +101,24 @@ RTP timestamps, `application/x-dmap-tagged` metadata and `image/jpeg` artwork
 
 ## Next action: M2
 
-1. **Delete the M0 spikes.** `cmd/spike-sonos` and `cmd/spike-raop` are not on
-   the daemon's path and have served their purpose.
-2. **React to topology changes.** Grouping is read once at startup, so grouping
+1. **React to topology changes.** Grouping is read once at startup, so grouping
    or ungrouping from the Sonos app leaves a target that silently does nothing.
-3. **Yield the speaker.** Subscribe to Sonos GENA events so taking a zone from
+2. **Yield the speaker.** Subscribe to Sonos GENA events so taking a zone from
    the Sonos app drops the AirPlay session instead of fighting over it.
-4. **Concurrent stream readers.** Sonos opens three HTTP connections at the
+3. **Concurrent stream readers.** Sonos opens three HTTP connections at the
    start of a session and keeps one — consistently the *last*. All three run
    their own reader against the same ring, and `Ring.Read` consumes, so for
-   about a second they steal samples from each other and the survivor starts
-   on a fragmented stream. Only a startup artifact, but real. The fix is to
-   let one connection consume and hand the others silence; it has not been
-   done because it risks breaking a working pipeline if the assumption about
-   which connection survives is ever wrong.
-5. Config file, systemd unit, `pct` install script.
+   about a second they steal samples from each other. Only a startup artifact,
+   but real. The fix is to let one connection consume and hand the others
+   silence; not done because it risks a working pipeline on an assumption
+   about which connection survives that is only supported by observation.
+4. **RTP timing and sync.** We bind the timing port but never read it, and
+   discard sync packets. AirConnect computes each frame's playtime from the
+   sender's clock and refuses to output until synced. Not needed for clean
+   playback, as it turns out — deadline pacing was the actual fix — but it is
+   the correct way to do this and would make drift handling principled rather
+   than emergent.
+5. Config file for zone names and volume mapping.
 
 Unverified: `raop.VolumeToSonos` maps −30…0 dB onto 0–100 with −144 as mute,
 which is a judgement call rather than something measured. Group collapse has
@@ -152,15 +158,36 @@ Each of these was reasoned out during design; they are not speculative.
   a group are silently ignored. Topology awareness belongs in M2, not "polish".
 - **Never let the stream run dry.** If bytes stop while AirPlay is paused, Sonos
   tears the stream down and takes seconds to recover. Feed digital silence.
+- **"Do not run dry" means the delivery *rate*, not just the connection.** The
+  writer emits one chunk per iteration, so pacing with a timeout delivers
+  chunk/timeout and is below realtime by construction — 250ms on 100ms chunks
+  is 40%, 2s is 5%, measured end to end at 21%. Below realtime the speaker
+  drains and falls silent while still reporting that it is playing, which
+  looks nothing like a buffer problem from the outside. Chunks are tied to an
+  absolute deadline for exactly this reason; do not reintroduce a timeout.
+- **A buffer can only be established at startup.** Exact pacing preserves the
+  ring's depth but cannot create it: once running, supply equals demand, so a
+  ring that starts empty stays empty and every jitter spike becomes a gap. The
+  reserve was measured at 4ms against a 700ms target and had been decorative
+  for a whole debugging session. The stream now opens with silence while the
+  ring fills behind it — silence does not consume the ring, so this holds
+  realtime from the first byte instead of stalling the speaker at connect.
+  AirConnect calls the same thing the http startup silence fill.
+- **When the counters are clean and it still sounds wrong, capture the audio.**
+  `-dump` writes the served PCM. Starvation appears as runs of exact zeros;
+  mis-ordering appears as waveform splices clustered at 352-frame boundaries;
+  loud music produces large sample deltas spread evenly across all offsets and
+  is not a fault at all. Those are trivially distinguishable in the samples and
+  indistinguishable in the statistics. Three rounds of inference were spent
+  before doing this, and the capture immediately ruled out decode, ordering and
+  loss, leaving pacing.
 - **But do not pad silence eagerly either.** This is the sharp edge of the rule
-  above and it cost a debugging round. Sonos buffers several seconds and will
-  accept bytes far faster than 44.1kHz while that buffer fills, so a reader
-  that pads the instant the ring is momentarily empty outruns the sender and
-  splices silence between every real chunk. That is audible as continuous
-  glitching, not as a gap, and it self-corrects once backpressure kicks in —
-  so it presents as "the first few seconds are broken". `Ring.Read` waits
-  `SilenceAfter` before padding, and playback is primed before the speaker is
-  told to fetch.
+  above. Sonos accepts bytes far faster than 44.1kHz while its own buffer
+  fills, so a reader that pads the instant the ring is momentarily empty
+  outruns the sender and splices silence between every real chunk — audible as
+  continuous glitching rather than as a gap. The deadline resolves both halves:
+  we wait for audio right up until the chunk is due, and pad only what is still
+  missing then. Never earlier, never later.
 - **One session's decoder is single-threaded, and SETUP starts two readers.**
   The audio port and the control port both deliver into `AudioDecoder` — the
   control port is not idle traffic, it carries retransmit responses, which are
