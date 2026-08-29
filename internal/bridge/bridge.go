@@ -6,9 +6,13 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -151,6 +155,13 @@ func (b *Bridge) SetVolume(db float64) {
 	}
 }
 
+// DumpDir, when set, makes every stream connection also write its bytes to a
+// .wav file there. It exists because "it sounds glitchy" is one symptom with
+// many causes, and past a point the counters stop being able to tell them
+// apart: this captures exactly what the speaker received, so the audio can be
+// examined instead of reasoned about.
+var DumpDir string
+
 // ServeStream writes the endless WAV. It returns when the speaker disconnects.
 func (b *Bridge) ServeStream(w http.ResponseWriter, r *http.Request) {
 	log.Printf("%s: speaker connected from %s (%s)",
@@ -161,7 +172,20 @@ func (b *Bridge) ServeStream(w http.ResponseWriter, r *http.Request) {
 	// Deliberately no Content-Length: the body never ends.
 	w.WriteHeader(http.StatusOK)
 
-	if _, err := w.Write(audio.WAVHeader()); err != nil {
+	var out io.Writer = w
+	if DumpDir != "" {
+		name := filepath.Join(DumpDir, fmt.Sprintf("%s-%d.wav",
+			safeFilename(b.Zone.Name), time.Now().UnixNano()))
+		if f, err := os.Create(name); err != nil {
+			log.Printf("%s: dump: %v", b.Zone.Name, err)
+		} else {
+			defer f.Close()
+			out = io.MultiWriter(w, f)
+			log.Printf("%s: dumping this connection to %s", b.Zone.Name, name)
+		}
+	}
+
+	if _, err := out.Write(audio.WAVHeader()); err != nil {
 		return
 	}
 	if f, ok := w.(http.Flusher); ok {
@@ -169,10 +193,45 @@ func (b *Bridge) ServeStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	start := time.Now()
-	err := audio.StreamPCM(w, b.ring, audio.SampleRate/10)
+	err := audio.StreamPCM(out, b.ring, audio.SampleRate/10)
 	under, dropped := b.ring.Stats()
 	log.Printf("%s: speaker disconnected after %s (silence-padded %d, dropped %d): %v",
 		b.Zone.Name, time.Since(start).Round(time.Second), under, dropped, err)
+}
+
+// safeFilename reduces a zone name to something that cannot escape the dump
+// directory.
+//
+// A zone name is not ours: it is the roomName out of a discovered device's
+// description XML, so anything that can answer an SSDP search can choose it.
+// A name of "../../etc/cron.d/x" would otherwise place a writable file
+// wherever the daemon can reach. Keeping only known-safe characters is used
+// rather than stripping bad ones, because a deny list has to anticipate every
+// separator and encoding and an allow list does not.
+func safeFilename(name string) string {
+	safe := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			return r
+		case r == '-', r == '_':
+			return r
+		case r == ' ':
+			return '_'
+		default:
+			return -1
+		}
+	}, name)
+
+	// Everything stripped, or a name that is only dots, must still yield a
+	// usable and harmless basename.
+	safe = strings.Trim(safe, "._-")
+	if safe == "" {
+		return "zone"
+	}
+	if len(safe) > 64 {
+		safe = safe[:64]
+	}
+	return safe
 }
 
 func newNonce() (string, error) {

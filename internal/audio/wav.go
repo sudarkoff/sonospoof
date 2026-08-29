@@ -63,10 +63,12 @@ const SilenceAfter = 250 * time.Millisecond
 // it waits for a resend to arrive. That produced a handful of discrete drops
 // per minute even with zero packets ultimately lost.
 //
-// 300ms comfortably covers a resend round trip on a LAN while adding little
-// to the two to four seconds of latency AirPlay and Sonos already impose
-// between them.
-const ReserveFrames = SampleRate * 3 / 10
+// It must exceed the resequencer's reorder window: holding a packet means
+// producing nothing meanwhile, so a window longer than the reserve starves the
+// stream exactly while it waits. 700ms covers the 512ms window with margin,
+// and is still small against the two to four seconds of latency AirPlay and
+// Sonos already impose between them.
+const ReserveFrames = SampleRate * 7 / 10
 
 // StreamPCM copies from the ring to w until w errors, which is how a Sonos
 // disconnect surfaces.

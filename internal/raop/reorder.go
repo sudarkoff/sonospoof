@@ -16,12 +16,20 @@ package raop
 
 // seqWindow is how many packets may be held waiting for a missing one.
 //
-// Each packet is 352 frames, ~8ms, so 32 packets is ~256ms of slack: far more
-// reordering than a healthy network produces, and still comfortably inside the
-// speaker's buffer. Beyond this we conclude the gap is a real loss rather than
-// a late arrival and skip forward, because continuing to wait would starve the
-// stream for something that is never coming.
-const seqWindow = 32
+// Each packet is 352 frames, ~8ms, so 64 packets is ~512ms of slack. Beyond
+// this we conclude the gap is a real loss rather than a late arrival and skip
+// forward, because continuing to wait would starve the stream for something
+// that is never coming.
+//
+// It was 32 (~256ms), which proved too tight over congested Wi-Fi: a session
+// reported 9 "late" packets, meaning resends that did arrive but only after we
+// had given up on them and skipped. Those were recoverable audio thrown away.
+//
+// This value is bounded from above by audio.ReserveFrames. Holding a packet
+// means producing nothing meanwhile, so a window longer than the reserve
+// starves the stream while waiting -- which is how the resend mechanism
+// created audible drops in the first place. See TestReorderWindowFitsReserve.
+const seqWindow = 64
 
 type resequencer struct {
 	next    uint16

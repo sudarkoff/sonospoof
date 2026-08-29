@@ -37,8 +37,10 @@ func main() {
 		iface      = flag.String("iface", "", "interface to advertise on (default: all)")
 		streamPort = flag.Int("stream-port", 0, "HTTP port for audio streams (0 = any)")
 		wait       = flag.Duration("wait", 3*time.Second, "SSDP listen time")
+		dumpDir    = flag.String("dump", "", "write each stream connection to a .wav here, for diagnosing audio faults")
 	)
 	flag.Parse()
+	bridge.DumpDir = *dumpDir
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
