@@ -29,15 +29,21 @@ set -euo pipefail
 # ---------------------------------------------------------------- config
 
 CTID="${CTID:-310}"
-HOSTNAME="${HOSTNAME:-sonospoof}"
+# Not HOSTNAME: bash sets that to the host's own name, so a default would
+# never apply and the container would be created named after the hypervisor.
+CTNAME="${CTNAME:-sonospoof}"
 STORAGE="${STORAGE:-local-lvm}"
 TEMPLATE_STORAGE="${TEMPLATE_STORAGE:-local}"
-TEMPLATE="${TEMPLATE:-debian-12-standard_12.7-1_amd64.tar.zst}"
+TEMPLATE="${TEMPLATE:-debian-12-standard_12.12-1_amd64.tar.zst}"
 BRIDGE="${BRIDGE:-vmbr0}"
 
-# VLAN tag for the speakers' network. 30 is George's IoT VLAN; set VLAN=""
-# for an untagged bridge.
-VLAN="${VLAN:-30}"
+# VLAN tag for the speakers' network. 30 is George's IoT VLAN.
+#
+# Set VLAN="" for an untagged bridge -- which is what you want when the bridge
+# is already VLAN-specific, e.g. a vmbr30 built on a tagged sub-interface.
+# Note ${VLAN-30} and not ${VLAN:-30}: the latter also substitutes for an
+# empty value, so VLAN="" would silently become 30 again.
+VLAN="${VLAN-30}"
 
 # DHCP by default. For a static address set e.g.
 #   IPV4="192.168.30.10/24" GATEWAY="192.168.30.1"
@@ -80,12 +86,12 @@ else
   [ -n "$GATEWAY" ] && net="${net},gw=${GATEWAY}"
 fi
 
-echo "creating container $CTID ($HOSTNAME) on ${BRIDGE}${VLAN:+ VLAN $VLAN}"
+echo "creating container $CTID ($CTNAME) on ${BRIDGE}${VLAN:+ VLAN $VLAN}"
 
 # Unprivileged: the daemon needs no elevated capabilities. Every port it binds
 # is above 1024 and it writes nothing outside its own tmp.
 pct create "$CTID" "$tpl" \
-  --hostname "$HOSTNAME" \
+  --hostname "$CTNAME" \
   --cores "$CORES" \
   --memory "$MEMORY" \
   --swap 0 \
