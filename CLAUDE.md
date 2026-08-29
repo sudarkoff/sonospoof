@@ -156,6 +156,11 @@ Each of these was reasoned out during design; they are not speculative.
   so it presents as "the first few seconds are broken". `Ring.Read` waits
   `SilenceAfter` before padding, and playback is primed before the speaker is
   told to fetch.
+- **One session's decoder is single-threaded, and SETUP starts two readers.**
+  The audio port and the control port both deliver into `AudioDecoder` — the
+  control port is not idle traffic, it carries retransmit responses, which are
+  audio. Anything reachable from `Packet` must be serialised. Do not add a
+  third reader without checking this.
 - **Diagnostics must reset per session.** The underrun counter originally
   spanned the process lifetime, which made a working stream look like it had
   never received a single sample and sent the first investigation to entirely
@@ -192,7 +197,12 @@ Each of these was reasoned out during design; they are not speculative.
 
 ## Conventions
 
-- `go build ./... && go vet ./... && gofmt -l .` before every commit.
+- `go build ./... && go vet ./... && gofmt -l . && go test -race ./...` before
+  every commit. `-race` is not optional here. Two UDP readers feeding one
+  session's decoder raced its scratch buffers for an entire debugging round,
+  and it presented as glitchy audio rather than a crash — a concurrent map
+  write panics loudly and gets fixed, but raced scratch buffers just emit
+  slightly wrong samples and look like a network fault.
 - Stdlib where practical. Current only dependency is `github.com/brutella/dnssd`
   for mDNS, chosen over `grandcat/zeroconf` for maintenance and interface
   control. Expect to replace it with our own responder eventually.
