@@ -1,0 +1,41 @@
+[Unit]
+Description=AirPlay bridge for first-generation Sonos speakers
+Documentation=https://github.com/sudarkoff/sonospoof
+# The daemon discovers speakers over SSDP at startup and needs the network to
+# be genuinely up, not merely configured.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sonospoof -iface eth0
+Restart=always
+RestartSec=5
+
+# Discovery is read once at startup, so a restart is how the daemon picks up
+# a speaker that was added, renamed, or regrouped. Restarting is cheap: an
+# idle session is just an advertisement.
+User=sonospoof
+Group=sonospoof
+
+# The daemon needs no privileges it cannot get as an ordinary user: every port
+# it binds is ephemeral or above 1024 (mDNS is 5353), and it writes nothing.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+# AF_NETLINK is required: the mDNS library watches for link changes so it can
+# re-announce when the interface comes back. Without it the daemon still runs
+# but stops re-advertising after a network blip.
+
+[Install]
+WantedBy=multi-user.target

@@ -35,3 +35,6 @@ go.work.sum
 /spike-sonos
 /spike-raop
 /sonospoof
+
+# Build output for LXC deployment
+/dist/
