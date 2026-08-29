@@ -8,9 +8,11 @@ package raop
 // and no amount of buffering downstream can repair it -- by then the samples
 // are already in the wrong order.
 //
-// This is a reordering buffer, not a retransmit implementation. It fixes
-// packets that arrive late but do arrive. Packets that never arrive still
-// leave a hole; requesting a resend on the control port is M2 work.
+// Reordering alone only fixes packets that arrive late but do arrive. For
+// packets that have genuinely gone missing, a resend is requested on the
+// control port as soon as the gap appears -- see resend.go. Anything still
+// missing when the window expires is skipped, because waiting longer would
+// starve the stream for something that is never coming.
 
 // seqWindow is how many packets may be held waiting for a missing one.
 //
@@ -25,6 +27,18 @@ type resequencer struct {
 	next    uint16
 	started bool
 	pending map[uint16][]byte
+
+	// onMissing, when set, is called as soon as a gap appears, so the caller
+	// can ask the sender to resend before the window runs out. Requesting
+	// immediately rather than at window expiry is what makes recovery
+	// possible at all: the packet has to arrive back inside the window to be
+	// any use.
+	onMissing func(first, count uint16)
+
+	// requested remembers the last gap we asked about, so a burst of
+	// subsequent packets does not re-request the same range on every arrival.
+	requested     uint16
+	haveRequested bool
 
 	// Diagnostics: reordered counts packets that arrived out of order and
 	// were successfully put back; lost counts positions skipped because the
@@ -66,6 +80,10 @@ func (q *resequencer) push(seq uint16, pkt []byte) [][]byte {
 
 	if seq != q.next {
 		q.Reordered++
+		// A gap has opened. Ask for the missing range now rather than when
+		// the window expires: a resend is only useful if it arrives before we
+		// give up and skip forward.
+		q.requestMissing(seq)
 	}
 	q.pending[seq] = pkt
 
@@ -77,6 +95,26 @@ func (q *resequencer) push(seq uint16, pkt []byte) [][]byte {
 		ready = append(ready, q.drain()...)
 	}
 	return ready
+}
+
+// requestMissing asks for everything between next and seq, once per gap.
+//
+// Re-requesting on every subsequent arrival would flood the sender: at 125
+// packets a second a single loss would otherwise produce a request per packet
+// until the window expired.
+func (q *resequencer) requestMissing(seq uint16) {
+	if q.onMissing == nil {
+		return
+	}
+	if q.haveRequested && q.requested == q.next {
+		return // already asked about this gap
+	}
+	count := seq - q.next
+	if count == 0 || count > seqWindow {
+		return
+	}
+	q.requested, q.haveRequested = q.next, true
+	q.onMissing(q.next, count)
 }
 
 // drain removes consecutively-numbered packets starting at next.

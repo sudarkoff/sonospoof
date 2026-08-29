@@ -59,6 +59,14 @@ func (a *AudioDecoder) Stats() (packets, reordered, lost, late, errs uint64) {
 	return a.Packets, a.queue.Reordered, a.queue.Lost, a.queue.Late, a.Errors
 }
 
+// OnMissing installs the callback used to ask the sender for a resend. It must
+// be set before packets start arriving.
+func (a *AudioDecoder) OnMissing(f func(first, count uint16)) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.queue.onMissing = f
+}
+
 // NewAudioDecoder builds the audio path for one session from the session key
 // and IV out of the ANNOUNCE SDP, and the ALAC config from a=fmtp.
 func NewAudioDecoder(key, iv []byte, cfg alac.Config, ring *audio.Ring) (*AudioDecoder, error) {

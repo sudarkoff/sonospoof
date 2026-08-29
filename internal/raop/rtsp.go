@@ -53,6 +53,7 @@ type Receiver struct {
 	running     bool
 	sessionName string   // from the ANNOUNCE i= line, e.g. "G's iPhone"
 	owner       net.Conn // the connection that sent ANNOUNCE
+	resend      *resendRequester
 }
 
 // Listen binds the RTSP port. Passing port 0 lets the OS choose, which is what
@@ -223,7 +224,7 @@ func (r *Receiver) handle(conn net.Conn, req *request) *response {
 		}
 
 	case "SETUP":
-		transport, err := r.setup(req.Headers["transport"])
+		transport, err := r.setup(conn, req.Headers["transport"])
 		if err != nil {
 			r.logf("%s: SETUP: %v", r.Name, err)
 			return &response{Status: "461 Unsupported Transport"}
@@ -292,7 +293,7 @@ func (r *Receiver) announce(conn net.Conn, body []byte) error {
 // The reference receivers bind fixed ports; we bind port 0 and advertise what
 // the OS gave us, because several zones run in one process and fixed ports
 // would collide on the second one.
-func (r *Receiver) setup(transport string) (string, error) {
+func (r *Receiver) setup(conn net.Conn, transport string) (string, error) {
 	if !strings.Contains(transport, "UDP") {
 		return "", fmt.Errorf("unsupported transport %q", transport)
 	}
@@ -312,13 +313,47 @@ func (r *Receiver) setup(transport string) (string, error) {
 		return "", err
 	}
 
+	// Wire up resend requests. The sender tells us its control port in the
+	// SETUP Transport header; we send requests there from our own control
+	// socket, and the replies come back as payload type 86 on the same socket.
+	var requester *resendRequester
+	if peer, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+		if p := transportPort(transport, "control_port"); p > 0 {
+			requester = newResendRequester(control, &net.UDPAddr{
+				IP: peer.IP, Port: p, Zone: peer.Zone,
+			})
+		} else {
+			r.logf("%s: sender gave no control_port; losses cannot be recovered", r.Name)
+		}
+	}
+
 	r.mu.Lock()
 	r.udp = []*net.UDPConn{server, control, timing}
+	r.resend = requester
+	if r.dec != nil && requester != nil {
+		r.dec.OnMissing(requester.request)
+	}
 	r.mu.Unlock()
 
 	return fmt.Sprintf(
 		"Transport: RTP/AVP/UDP;unicast;mode=record;server_port=%d;control_port=%d;timing_port=%d",
 		port(server), port(control), port(timing)), nil
+}
+
+// transportPort pulls a "name=NNNNN" value out of an RTSP Transport header.
+func transportPort(transport, name string) int {
+	for _, field := range strings.Split(transport, ";") {
+		k, v, ok := strings.Cut(strings.TrimSpace(field), "=")
+		if !ok || k != name {
+			continue
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			return 0
+		}
+		return n
+	}
+	return 0
 }
 
 // bindUDP opens an ephemeral UDP port. When receive is true a goroutine reads
@@ -396,9 +431,11 @@ func (r *Receiver) teardown() {
 	r.mu.Lock()
 	wasRunning := r.running
 	dec := r.dec
+	resend := r.resend
 	r.running = false
 	r.dec = nil
 	r.owner = nil
+	r.resend = nil
 	r.mu.Unlock()
 
 	// Report what the network did, so a glitchy session can be attributed
@@ -406,8 +443,15 @@ func (r *Receiver) teardown() {
 	// is what is actually audible.
 	if wasRunning && dec != nil {
 		packets, reordered, lost, late, errs := dec.Stats()
-		r.logf("%s: %d packets, %d reordered, %d lost, %d late, %d decode errors",
-			r.Name, packets, reordered, lost, late, errs)
+		var asked uint64
+		if resend != nil {
+			asked = resend.Requested.Load()
+		}
+		// "lost" is what survived the resend attempts, so it is the number
+		// that should actually be audible. asked minus lost is roughly what
+		// retransmission recovered.
+		r.logf("%s: %d packets, %d reordered, %d resends asked, %d lost, %d late, %d decode errors",
+			r.Name, packets, reordered, asked, lost, late, errs)
 	}
 
 	r.closeUDP()
