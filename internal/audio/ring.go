@@ -103,6 +103,18 @@ func (r *Ring) Read(dst []int16, wait time.Duration) int {
 		return got
 	}
 
+	// A non-positive wait means "take what is there and pad the rest now",
+	// which is what a deadline-paced caller wants once its deadline is spent.
+	if wait <= 0 {
+		r.mu.Lock()
+		r.underrun += uint64(len(dst) - got)
+		r.mu.Unlock()
+		for i := got; i < len(dst); i++ {
+			dst[i] = 0
+		}
+		return got
+	}
+
 	deadline := time.NewTimer(wait)
 	defer deadline.Stop()
 

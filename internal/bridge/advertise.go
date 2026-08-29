@@ -85,8 +85,18 @@ func txtRecords() map[string]string {
 		"vn":      "65537",
 		"tp":      "UDP",   // audio transport
 		"vs":      "105.1", // AirTunes version; iOS gates behaviour on this
-		"am":      "AirPort4,107",
-		"md":      "0,1,2", // metadata: text, artwork, progress
-		"sf":      "0x4",
+		// am is the model identifier, and iOS picks the AirPlay picker glyph
+		// from it. AudioAccessory5,1 is Apple's HomePod identifier, and is
+		// what a genuine AirPlay-capable Sonos advertises -- read off one on
+		// this network rather than guessed. AirPort4,107 gets an AirPort
+		// Express icon, which is accurate about our lineage and wrong about
+		// what the user is actually selecting.
+		//
+		// iOS renders from its own icon set, so this yields the speaker glyph
+		// rather than a literal Sonos rendering. There is no way to supply a
+		// custom image over RAOP.
+		"am": "AudioAccessory5,1",
+		"md": "0,1,2", // metadata: text, artwork, progress
+		"sf": "0x4",
 	}
 }

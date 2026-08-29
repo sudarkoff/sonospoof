@@ -5,51 +5,68 @@ import (
 	"time"
 )
 
-// The regression this guards: with no reserve the ring sits at zero depth,
-// because the speaker accepts bytes far faster than realtime while its own
-// buffer fills. Any upstream stall then starves the stream immediately, which
-// is audible as a discrete drop even when no packet was ever lost.
-func TestStreamPCMKeepsAReserveBuffered(t *testing.T) {
+// With a steady realtime supply the reader should hold roughly the reserve in
+// hand rather than handing everything over the moment it exists.
+//
+// That buffer is what absorbs an upstream stall -- most often the resequencer
+// waiting on a resend -- so that the deadline-paced writer finds audio ready
+// when a chunk falls due and does not have to pad.
+//
+// Note the reader will still drain the ring when a deadline arrives and audio
+// is genuinely absent: holding realtime matters more than holding the reserve.
+// An earlier version of this test asserted the ring was never drained, which
+// encoded the wrong contract.
+func TestReserveIsHeldUnderSteadySupply(t *testing.T) {
 	r := NewRing(SampleRate * Channels * 2)
+	const chunkFrames = SampleRate / 10 // 100ms
 
-	const chunkFrames = 64
-	need := chunkFrames*Channels + ReserveFrames*Channels
-
-	// Supply exactly one chunk -- less than chunk+reserve. A reader that does
-	// not hold a reserve would consume it instantly.
-	r.Write(make([]int16, chunkFrames*Channels))
-
-	done := make(chan struct{})
 	w := &countingWriter{}
+	done := make(chan struct{})
 	go func() {
 		_ = StreamPCM(w, r, chunkFrames)
 		close(done)
 	}()
 
-	// Within the reserve wait it should not have drained the ring to nothing.
-	time.Sleep(SilenceAfter / 2)
-	if got := r.Len(); got == 0 {
-		t.Error("reader drained the ring instead of waiting for a reserve")
-	}
+	// Feed at realtime in small packets, as the RTP path does.
+	stop := make(chan struct{})
+	go func() {
+		tick := time.NewTicker(8 * time.Millisecond) // ~AirPlay's packet rate
+		defer tick.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-tick.C:
+				r.Write(make([]int16, 352*Channels))
+			}
+		}
+	}()
 
-	// Now supply enough to clear the reserve and it should proceed.
-	r.Write(make([]int16, need))
-	time.Sleep(SilenceAfter)
-	if w.Writes() == 0 {
-		t.Error("reader never wrote once the reserve was available")
-	}
-
+	// Let it reach steady state, then sample the depth.
+	time.Sleep(1500 * time.Millisecond)
+	depth := r.Len()
+	close(stop)
 	w.Fail()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Error("StreamPCM did not return after a write error")
+
+	<-done
+
+	depthMS := float64(depth) / Channels / SampleRate * 1000
+	reserveMS := float64(ReserveFrames) / SampleRate * 1000
+
+	if depth == 0 {
+		t.Errorf("ring was empty at steady state; no reserve is being held")
 	}
+	// Generous bound: the point is that a meaningful buffer exists, not that
+	// it tracks the target precisely.
+	if depthMS < reserveMS/4 {
+		t.Errorf("steady-state depth %.0fms is far below the %.0fms reserve",
+			depthMS, reserveMS)
+	}
+	t.Logf("steady-state depth %.0fms against a %.0fms reserve", depthMS, reserveMS)
 }
 
-// The reserve must not be so large it defeats the point: it has to fit inside
-// the ring alongside a chunk, or the reader waits for something the ring can
-// never hold.
+// The reserve has to fit alongside a chunk in the ring, or the reader waits
+// for something the ring can never hold.
 func TestReserveFitsInTheRing(t *testing.T) {
 	ringSamples := SampleRate * Channels * 2 // what bridge allocates
 	chunk := (SampleRate / 10) * Channels
