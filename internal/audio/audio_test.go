@@ -3,6 +3,7 @@ package audio
 import (
 	"bytes"
 	"encoding/binary"
+	"sync"
 	"testing"
 	"time"
 )
@@ -200,6 +201,36 @@ func TestStreamPCMStopsOnWriteError(t *testing.T) {
 	if w.n == 0 {
 		t.Error("nothing was written before the error")
 	}
+}
+
+// countingWriter accepts writes until Fail is called, then errors so a
+// StreamPCM goroutine can be unwound.
+type countingWriter struct {
+	mu     sync.Mutex
+	writes int
+	failed bool
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.failed {
+		return 0, errClosed
+	}
+	c.writes++
+	return len(p), nil
+}
+
+func (c *countingWriter) Writes() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.writes
+}
+
+func (c *countingWriter) Fail() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.failed = true
 }
 
 type shortWriter struct {

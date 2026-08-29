@@ -53,6 +53,21 @@ func WAVHeader() []byte {
 // buffer so that a genuine pause is covered before the stream runs dry.
 const SilenceAfter = 250 * time.Millisecond
 
+// ReserveFrames is how much audio to keep buffered rather than hand straight
+// to the speaker.
+//
+// Without a reserve the ring sits at zero depth: Sonos accepts bytes far
+// faster than 44.1kHz until its own buffer fills, so everything produced is
+// given away immediately. Any upstream stall then starves the stream at once
+// -- and there is a routine one, because the resequencer holds packets while
+// it waits for a resend to arrive. That produced a handful of discrete drops
+// per minute even with zero packets ultimately lost.
+//
+// 300ms comfortably covers a resend round trip on a LAN while adding little
+// to the two to four seconds of latency AirPlay and Sonos already impose
+// between them.
+const ReserveFrames = SampleRate * 3 / 10
+
 // StreamPCM copies from the ring to w until w errors, which is how a Sonos
 // disconnect surfaces.
 //
@@ -72,8 +87,18 @@ func StreamPCM(w io.Writer, r *Ring, chunkFrames int) error {
 	samples := make([]int16, chunkFrames*Channels)
 	raw := make([]byte, len(samples)*2)
 
+	reserve := ReserveFrames * Channels
+
 	for {
-		r.Read(samples, SilenceAfter) // fills completely; pads only on a real stall
+		// Hold a reserve back rather than handing the speaker everything the
+		// moment it is available. Waiting for chunk+reserve keeps that much
+		// audio buffered at all times, which is what absorbs an upstream
+		// stall -- most often the resequencer holding packets while a resend
+		// is in flight. On a timeout we fall through and Read pads, so a
+		// genuinely stopped sender still cannot dry the stream out.
+		r.WaitFor(len(samples)+reserve, SilenceAfter)
+
+		r.Read(samples, SilenceAfter)
 		for i, s := range samples {
 			binary.LittleEndian.PutUint16(raw[i*2:], uint16(s))
 		}
