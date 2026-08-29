@@ -3,6 +3,7 @@ package audio
 import (
 	"encoding/binary"
 	"io"
+	"time"
 )
 
 const (
@@ -44,14 +45,24 @@ func WAVHeader() []byte {
 	return h
 }
 
+// SilenceAfter is how long StreamPCM waits for audio before deciding the
+// sender has stopped and padding with silence.
+//
+// AirPlay sends about 125 packets a second, so any value well above 8ms
+// absorbs ordinary jitter. It must also stay well under the speaker's own
+// buffer so that a genuine pause is covered before the stream runs dry.
+const SilenceAfter = 250 * time.Millisecond
+
 // StreamPCM copies from the ring to w until w errors, which is how a Sonos
 // disconnect surfaces.
 //
-// Pacing is left entirely to TCP backpressure rather than a ticker. The
-// speaker buffers a few seconds and then stops reading, which blocks these
-// writes at exactly the speaker's own clock rate -- no drift to accumulate and
-// no timer to get wrong. A ticker would have to guess the rate and would
-// slowly diverge from whatever the hardware is actually doing.
+// Rate is set by the reader waiting on the ring, not by a ticker and not by
+// TCP backpressure alone. Backpressure looks like it should pace this -- the
+// speaker stops reading when its buffer is full -- but that buffer is several
+// seconds deep, so at the start of a session the speaker will swallow
+// everything offered as fast as it is produced. A reader that never waits
+// therefore outruns the sender's 44.1kHz and splices silence between every
+// real chunk, which is audible as continuous glitching rather than as a gap.
 //
 // chunk is in sample frames; 4410 is 100ms.
 func StreamPCM(w io.Writer, r *Ring, chunkFrames int) error {
@@ -62,7 +73,7 @@ func StreamPCM(w io.Writer, r *Ring, chunkFrames int) error {
 	raw := make([]byte, len(samples)*2)
 
 	for {
-		r.Read(samples) // always fills; pads silence on underrun
+		r.Read(samples, SilenceAfter) // fills completely; pads only on a real stall
 		for i, s := range samples {
 			binary.LittleEndian.PutUint16(raw[i*2:], uint16(s))
 		}

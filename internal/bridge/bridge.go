@@ -23,6 +23,12 @@ import (
 // four seconds that are already inherent.
 const ringSeconds = 2
 
+// prebufferSamples is how much audio to accumulate before telling the speaker
+// to start. Half a second is plenty to cover the gap between RECORD and the
+// first packets without adding meaningfully to the two to four seconds of
+// latency that AirPlay and Sonos already impose between them.
+const prebufferSamples = audio.SampleRate * audio.Channels / 2
+
 // Bridge is one zone's pipeline: an AirPlay target, a ring, and the Sonos it
 // pushes to.
 type Bridge struct {
@@ -90,6 +96,15 @@ func (b *Bridge) Start(sessionName string) error {
 	title := "AirPlay"
 	if sessionName != "" {
 		title = sessionName
+	}
+
+	// Prime the buffer before the speaker is told to fetch. Sonos opens the
+	// stream immediately and swallows several seconds as fast as we will
+	// produce them, so starting against an empty ring guarantees the head of
+	// the session is padded silence spliced into the first real audio.
+	if !b.ring.WaitFor(prebufferSamples, 3*time.Second) {
+		log.Printf("%s: starting with only %d/%d samples buffered",
+			b.Zone.Name, b.ring.Len(), prebufferSamples)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
