@@ -51,7 +51,8 @@ type Receiver struct {
 	dec         *AudioDecoder
 	udp         []*net.UDPConn
 	running     bool
-	sessionName string // from the ANNOUNCE i= line, e.g. "G's iPhone"
+	sessionName string   // from the ANNOUNCE i= line, e.g. "G's iPhone"
+	owner       net.Conn // the connection that sent ANNOUNCE
 }
 
 // Listen binds the RTSP port. Passing port 0 lets the OS choose, which is what
@@ -96,7 +97,11 @@ func (r *Receiver) logf(format string, args ...any) {
 
 func (r *Receiver) session(conn net.Conn) {
 	defer conn.Close()
-	defer r.teardown()
+	// Only the connection that negotiated the session may end it. Senders
+	// open several RTSP connections -- an iPhone opened four during M0 -- and
+	// tearing down whenever any of them closes would kill the live session's
+	// UDP sockets and decoder from a stale one.
+	defer r.closeIfOwner(conn)
 
 	br := bufio.NewReader(conn)
 	for {
@@ -212,7 +217,7 @@ func (r *Receiver) handle(conn net.Conn, req *request) *response {
 			"Public: ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, TEARDOWN, OPTIONS, GET_PARAMETER, SET_PARAMETER")
 
 	case "ANNOUNCE":
-		if err := r.announce(req.Body); err != nil {
+		if err := r.announce(conn, req.Body); err != nil {
 			r.logf("%s: ANNOUNCE: %v", r.Name, err)
 			return &response{Status: "400 Bad Request"}
 		}
@@ -254,7 +259,7 @@ func (r *Receiver) handle(conn net.Conn, req *request) *response {
 	return resp
 }
 
-func (r *Receiver) announce(body []byte) error {
+func (r *Receiver) announce(conn net.Conn, body []byte) error {
 	sdp, err := ParseSDP(body)
 	if err != nil {
 		return err
@@ -271,6 +276,9 @@ func (r *Receiver) announce(body []byte) error {
 	r.mu.Lock()
 	r.dec = dec
 	r.sessionName = sdp.Name
+	// This connection now owns the session, and is the only one whose closing
+	// may tear it down.
+	r.owner = conn
 	r.mu.Unlock()
 
 	r.logf("%s: session from %q, ALAC %d frames %d-bit %dch @ %dHz",
@@ -368,11 +376,28 @@ func (r *Receiver) record() error {
 	return nil
 }
 
+// closeIfOwner tears the session down only when the connection that
+// negotiated it is the one going away. A sender's other connections coming
+// and going must not disturb a live stream.
+func (r *Receiver) closeIfOwner(conn net.Conn) {
+	r.mu.Lock()
+	owner := r.owner
+	r.mu.Unlock()
+
+	// An owner of nil means no ANNOUNCE arrived on any connection, so there is
+	// nothing to protect and nothing to tear down.
+	if owner != nil && owner != conn {
+		return
+	}
+	r.teardown()
+}
+
 func (r *Receiver) teardown() {
 	r.mu.Lock()
 	wasRunning := r.running
 	r.running = false
 	r.dec = nil
+	r.owner = nil
 	r.mu.Unlock()
 
 	r.closeUDP()
