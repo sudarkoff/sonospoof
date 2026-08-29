@@ -406,7 +406,15 @@ func (r *Receiver) record() error {
 	}
 	r.Ring.Reset()
 	if r.Handler != nil {
-		return r.Handler.Start(name)
+		// Start off the RTSP thread. The sender does not begin sending audio
+		// until its RECORD is answered, so anything Start does that waits for
+		// audio -- priming the buffer, say -- deadlocks against the response
+		// it is waiting on, and the session begins dry and late anyway.
+		go func() {
+			if err := r.Handler.Start(name); err != nil {
+				r.logf("%s: start: %v", r.Name, err)
+			}
+		}()
 	}
 	return nil
 }
