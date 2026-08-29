@@ -104,9 +104,14 @@ RTP timestamps, `application/x-dmap-tagged` metadata and `image/jpeg` artwork
    or ungrouping from the Sonos app leaves a target that silently does nothing.
 3. **Yield the speaker.** Subscribe to Sonos GENA events so taking a zone from
    the Sonos app drops the AirPlay session instead of fighting over it.
-4. **RTP retransmits.** Nothing currently requests a resend, so every Wi-Fi
-   hiccup is a dropout. The control port is bound and read but only parsed far
-   enough to ignore.
+4. **Concurrent stream readers.** Sonos opens three HTTP connections at the
+   start of a session and keeps one — consistently the *last*. All three run
+   their own reader against the same ring, and `Ring.Read` consumes, so for
+   about a second they steal samples from each other and the survivor starts
+   on a fragmented stream. Only a startup artifact, but real. The fix is to
+   let one connection consume and hand the others silence; it has not been
+   done because it risks breaking a working pipeline if the assumption about
+   which connection survives is ever wrong.
 5. Config file, systemd unit, `pct` install script.
 
 Unverified: `raop.VolumeToSonos` maps −30…0 dB onto 0–100 with −144 as mute,
@@ -170,8 +175,18 @@ Each of these was reasoned out during design; they are not speculative.
 - **Clock drift.** The phone's 44.1 kHz is not the speaker's. TCP backpressure
   covers most of it; an elastic buffer handles the rest by dropping or
   duplicating a frame when it drifts out of band.
-- **RTP retransmits.** RAOP has a resend-request mechanism on the control port.
-  Without it every Wi-Fi hiccup is an audible dropout.
+- **RTP retransmits.** Implemented. Requests go out the moment a gap appears
+  rather than at window expiry, because a resend only helps if it lands before
+  we skip forward, and once per gap because at 125 packets/sec re-requesting on
+  every arrival would flood the sender.
+- **"Glitchy audio" had three separate causes**, and each one masked the next.
+  Worth knowing because the symptom was identical every time and only the
+  counters told them apart: frames decoded in arrival order (fixed by
+  resequencing), a data race between the two UDP readers (fixed by a mutex,
+  found only by running `-race`), and genuine packet loss (fixed by resend
+  requests). The lesson is that "it sounds glitchy" is one symptom with many
+  causes, so instrument first — the counters at teardown exist for this and
+  each cause showed up as a different line in them.
 - **Volume is a curve, not a rescale.** AirPlay sends −144.0…0.0 dB, Sonos wants
   0–100 linear.
 - **Yield the speaker.** Subscribe to Sonos GENA events so taking the zone from
