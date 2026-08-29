@@ -38,6 +38,8 @@ import (
 	"time"
 
 	"github.com/brutella/dnssd"
+
+	"github.com/sudarkoff/sonospoof/internal/raop"
 )
 
 func main() {
@@ -136,13 +138,14 @@ func main() {
 			log.Printf("accept: %v", err)
 			continue
 		}
-		go handle(conn, atomic.AddInt64(&sessions, 1))
+		go handle(conn, atomic.AddInt64(&sessions, 1), nic.HardwareAddr)
 	}
 }
 
 // handle dumps one RTSP session. It answers just enough to keep the client
-// talking; it does not implement the handshake.
-func handle(conn net.Conn, id int64) {
+// talking, which -- as M0 established -- means answering the Apple-Challenge:
+// iOS will not send ANNOUNCE without a valid Apple-Response.
+func handle(conn net.Conn, id int64, mac net.HardwareAddr) {
 	defer conn.Close()
 	peer := conn.RemoteAddr().String()
 	log.Printf("[%d] connection from %s", id, peer)
@@ -183,7 +186,7 @@ func handle(conn net.Conn, id int64) {
 		dumpRequest(id, line, headers, body)
 		flagAuthPath(id, method, target, headers)
 
-		if err := respond(conn, method, headers); err != nil {
+		if err := respond(conn, method, headers, mac, id); err != nil {
 			log.Printf("[%d] write: %v", id, err)
 			return
 		}
@@ -226,8 +229,24 @@ func dumpRequest(id int64, requestLine string, headers map[string]string, body [
 
 // respond sends the minimum that keeps a client progressing through the
 // handshake, so we can observe as many request types as possible.
-func respond(conn net.Conn, method string, headers map[string]string) error {
+func respond(conn net.Conn, method string, headers map[string]string, mac net.HardwareAddr, id int64) error {
 	var extra []string
+
+	// Answering the challenge is not optional. M0 showed both that iOS quits
+	// after OPTIONS without an Apple-Response, and that advertising et=0 to
+	// dodge the challenge just makes it quit without asking.
+	if ch, ok := headers["apple-challenge"]; ok {
+		local, _ := conn.LocalAddr().(*net.TCPAddr)
+		if local == nil {
+			log.Printf("[%d] cannot answer challenge: local address is not TCP", id)
+		} else if resp, err := raop.AppleResponse(ch, local.IP, mac); err != nil {
+			log.Printf("[%d] answering Apple-Challenge: %v", id, err)
+		} else {
+			extra = append(extra, "Apple-Response: "+resp)
+			log.Printf("[%d] answered Apple-Challenge (local %s, mac %s)", id, local.IP, mac)
+		}
+	}
+
 	switch method {
 	case "OPTIONS":
 		extra = append(extra, "Public: ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, TEARDOWN, OPTIONS, GET_PARAMETER, SET_PARAMETER")

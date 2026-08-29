@@ -14,44 +14,78 @@ iPhone --AirPlay/RAOP--> [ sonospoof ] --HTTP stream--> Sonos
 Develop on `claude/airplay-sonos-proxmox-app-yk8clo`. Do not open a PR unless
 asked.
 
-## State: end of M0
+## State: M0 complete (2026-08-29)
 
-Two throwaway reconnaissance probes exist under `cmd/`. There is no daemon yet
-and no `internal/` package tree — do not assume one.
+Both probes have now been run against real hardware on George's LAN. Every M0
+question is answered; see "M0 findings" below. `internal/raop` exists and is
+real M1 code with tests — the probes under `cmd/` are still throwaway and
+should be deleted when M1 lands, but do not delete `internal/`.
 
-- `cmd/spike-sonos` — SSDP discovery, zone-group topology, push a URL to a zone.
-  Stdlib only. Verified locally only against the no-speakers path.
-- `cmd/spike-raop` — fake `_raop._tcp` advertisement plus a full RTSP dumper.
-  Verified locally against a synthetic iOS handshake; never yet run against a
-  real phone.
+- `cmd/spike-sonos` — SSDP discovery, topology, push a URL to a zone. Now also
+  has `-hosts` (skip SSDP, name players directly) and `-src` (pin the egress
+  interface). Verified against three Play:1 units.
+- `cmd/spike-raop` — `_raop._tcp` advertisement plus RTSP dumper. Now answers
+  the Apple-Challenge via `internal/raop`, which is what got us a real
+  ANNOUNCE. An iPhone connects and plays to it.
+- `internal/raop` — the embedded AirPort Express key, the Apple-Response, and
+  session key/IV unwrapping. 7 tests, all against captured real values.
 
-Neither probe has been run against real hardware. Both are throwaway; when M1
-lands, delete them rather than growing them into the daemon.
+## M0 findings
 
-## Next action, and what it is blocked on
+**The network was the hard part, not the protocol.**
 
-**M1 cannot start until the probes run on George's LAN.** He is doing this from
-the command line. Ask for the results before writing receiver code.
+The Sonos live on the **IoT VLAN, 192.168.30.0/24**; George's dev machine was
+on Hades, 192.168.20.0/24. Two independent failures came out of that:
 
-1. `spike-sonos` from the Proxmox LXC. Does it see the Gen1s? That is the
-   multicast/bridging question and everything else is moot if it fails. Then
-   `-play` with any internet radio URL, with and without `-raw`, to settle
-   whether `x-rincon-mp3radio://` beats plain `http://` for an endless stream.
-2. `spike-raop -iface <lan>`, then select it from the iPhone's AirPlay menu.
-   Three outcomes, pointing three different directions:
-   - **Not listed** → mDNS or interface problem, not protocol.
-   - **`Apple-Challenge` header on OPTIONS** → legacy RSA. Expected case.
-     M1 is then a straight line: leaked AirPort Express key answers the
-     challenge, AES-128-CBC decrypt, ALAC decode, ring buffer, WAV out.
-   - **`POST /fp-setup`** → FairPlay. Bisect the mDNS TXT records with `-et`
-     and `-cn` (and try `vs=` values) until it stops. This is the one outcome
-     that meaningfully changes the M1 estimate.
+1. **SSDP cannot cross a VLAN.** It is link-scoped multicast and UniFi
+   reflects mDNS only, so M-SEARCH is never answered — multicast *or* unicast
+   form, any `ST`. Unicast HTTP to port 1400 works throughout. Use `-hosts`,
+   or put the host on the speakers' VLAN.
+2. **IoT → Internal is return-traffic only**, so a speaker cannot open a
+   connection back to a stream server on another VLAN. `SetAVTransportURI`
+   succeeds and the title shows in the Sonos app, but no SYN ever arrives and
+   the transport sits in STOPPED. **This is why the bridge must live on the
+   IoT VLAN.** Both `Internal→IoT` and `Users→IoT` are allowed, so the phone
+   still reaches it from anywhere but Guest.
 
-The `ANNOUNCE` SDP from step 2 is the real prize. Its `a=fmtp:96` line is the
-ALAC config the decoder gets written against — fields are: frame length,
-compatible version, bit depth, pb, mb, kb, channels, maxRun, maxFrameBytes,
-avgBitRate, sample rate. Expect `352 0 16 40 10 14 2 255 0 0 44100`.
-`a=rsaaeskey` and `a=aesiv` carry the wrapped AES key for the audio stream.
+**`http://` beats `x-rincon-mp3radio://` for WAV, decisively.** The rincon
+scheme flips the speaker into Shoutcast mode (it connects as `Nullsoft Winamp3
+(compatible)`), expects MP3 framing, and tears the stream down after ~11s.
+Plain `http://` held a single connection for 75s+ still PLAYING. The hunch in
+the old notes was backwards: rincon is for endless *MP3*, not endless WAV.
+
+**Auth is the legacy RSA path.** `Apple-Challenge` on OPTIONS, no `/fp-setup`
+ever. Sender is `AirPlay/960.13.1`. Note that **answering the challenge is
+mandatory, not merely expected**: advertising `et=0` to sidestep it makes iOS
+skip the challenge and then refuse to proceed past OPTIONS anyway. There is no
+unencrypted shortcut.
+
+**The captured ANNOUNCE**, which the decoder gets written against:
+
+```
+a=rtpmap:96 AppleLossless
+a=fmtp:96 352 0 16 40 10 14 2 255 0 0 44100
+a=min-latency:11025
+a=max-latency:88200
+```
+
+The ALAC params are exactly as predicted. Post-RECORD the phone sends
+`SET_PARAMETER` with `volume: -20.000000`, `progress: <start>/<now>/<end>` in
+RTP timestamps, `application/x-dmap-tagged` metadata and `image/jpeg` artwork
+— M3 material, but it arrives whether or not we want it yet.
+
+## Next action: M1
+
+Single hardcoded zone, WAV out, end to end. The handshake is solved; what
+remains is the audio path.
+
+1. Bind the three UDP ports and return the real ones from SETUP. The client's
+   `timing_port` and `control_port` come in on the SETUP `Transport:` header.
+2. AES-128-CBC decrypt each RTP payload with `raop.SessionKey`/`SessionIV`.
+   Note the trailing partial block is left in the clear — do not pad it.
+3. ALAC decode against the `a=fmtp:96` config above.
+4. Ring buffer, then the WAV writer feeding the Sonos over plain `http://`.
+5. Feed digital silence when AirPlay pauses; never let the stream run dry.
 
 ## Decided — do not re-litigate
 
@@ -99,6 +133,22 @@ Each of these was reasoned out during design; they are not speculative.
   the Sonos app drops the AirPlay session instead of fighting over it.
 - **mDNS TXT feature bits are the most likely thing to be wrong** in the whole
   project. When a device is invisible or refuses to connect, suspect them first.
+- **iOS connects over IPv6 link-local**, not IPv4 — observed throughout M0
+  (`fe80::…%en0`). Two consequences. The Apple-Response signs
+  `challenge || localIP || mac`, and over IPv6 that block is 38 bytes and is
+  *not* zero-padded (the 32-byte pad is a floor, not a fixed size); using the
+  IPv4 form yields a well-formed signature the sender silently rejects. And
+  link-local traffic never reaches the router, so inter-VLAN firewall
+  reasoning does not govern the phone→bridge path.
+- **Take the local IP from the accepted connection**, never from config, for
+  the same reason.
+- **Do not derive the RAOP id from the NIC MAC.** macOS rotates its private
+  Wi-Fi MAC per network, so the advertised instance name changed when the host
+  changed VLAN and iOS would see a different device. The LXC is stable, but
+  the daemon should use a persistent configured id regardless.
+- **Two RSA padding modes, not one.** Apple-Response is PKCS#1 v1.5 with *no*
+  hash (`crypto.Hash(0)` — the block is signed directly, not digested).
+  `a=rsaaeskey` is OAEP/SHA-1. They are not interchangeable.
 
 ## Conventions
 
