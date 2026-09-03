@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/sudarkoff/sonospoof/internal/bridge"
+	"github.com/sudarkoff/sonospoof/internal/raop"
 	"github.com/sudarkoff/sonospoof/internal/sonos"
 )
 
@@ -38,9 +39,11 @@ func main() {
 		streamPort = flag.Int("stream-port", 0, "HTTP port for audio streams (0 = any)")
 		wait       = flag.Duration("wait", 3*time.Second, "SSDP listen time")
 		dumpDir    = flag.String("dump", "", "write each stream connection to a .wav here, for diagnosing audio faults")
+		idSalt     = flag.Int("id-salt", 0, "perturb advertised RAOP ids; use when a sender refuses one target and will not be reset")
 	)
 	flag.Parse()
 	bridge.DumpDir = *dumpDir
+	bridge.IDSalt = byte(*idSalt)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -75,7 +78,7 @@ func main() {
 	for _, z := range zones {
 		b := bridge.New(z, streamHost)
 
-		port, err := b.Receiver().Listen(0)
+		port, err := b.Receiver().Listen(raop.StablePort(z.CoordinatorUUID))
 		if err != nil {
 			log.Fatalf("%s: rtsp listen: %v", z.Name, err)
 		}

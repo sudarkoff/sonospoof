@@ -32,11 +32,44 @@ func NewAdvertiser(iface string) (*Advertiser, error) {
 // The instance name must be "<12 hex>@<display name>" or the device is either
 // invisible or unselectable. The hex is the zone's own id, derived from the
 // Sonos MAC, so every target is distinct and stable across restarts.
+// IDSalt, when non-zero, perturbs the last byte of every advertised RAOP id.
+//
+// This exists for one specific failure: a sender that has decided not to talk
+// to a particular device and will not be argued out of it. macOS was observed
+// resolving a zone's advert correctly, with the listener answering a
+// hand-rolled RTSP OPTIONS from that same machine, and still never emitting a
+// SYN for it -- while other zones from the same daemon worked. Flushing the
+// mDNS cache, restarting ControlCenter and rebooting the speaker changed
+// nothing, because the decision is made inside the client before any packet is
+// sent.
+//
+// Changing the id makes the target a device the sender has no history with.
+// It is a workaround, not an explanation, and it costs the stable identity
+// that keeps senders from seeing a new device after every restart -- so change
+// it only when a sender is actually stuck, and then leave it alone.
+var IDSalt byte
+
+// SaltedID applies IDSalt to a zone's RAOP id.
+//
+// Both the mDNS advertisement and the Apple-Response must use the same value:
+// the sender verifies the signature over challenge||localIP||mac, and the only
+// mac it knows is the one in the instance name we published. Salt one and not
+// the other and the signature is well-formed but wrong, which the sender
+// rejects silently.
+func SaltedID(id net.HardwareAddr) net.HardwareAddr {
+	if IDSalt == 0 || len(id) == 0 {
+		return id
+	}
+	out := append(net.HardwareAddr(nil), id...)
+	out[len(out)-1] ^= IDSalt
+	return out
+}
+
 func (a *Advertiser) Add(name string, id net.HardwareAddr, port int) error {
 	if id == nil {
 		return fmt.Errorf("advertise %q: no RAOP id", name)
 	}
-	hex := strings.ToUpper(strings.ReplaceAll(id.String(), ":", ""))
+	hex := strings.ToUpper(strings.ReplaceAll(SaltedID(id).String(), ":", ""))
 
 	cfg := dnssd.Config{
 		Name:   hex + "@" + name,

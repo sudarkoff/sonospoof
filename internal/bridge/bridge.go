@@ -59,7 +59,7 @@ func New(z sonos.Zone, streamHost string) *Bridge {
 	}
 	b.recv = &raop.Receiver{
 		Name:    z.Name,
-		ID:      z.RAOPID,
+		ID:      SaltedID(z.RAOPID),
 		Ring:    b.ring,
 		Handler: b,
 		Logf:    log.Printf,

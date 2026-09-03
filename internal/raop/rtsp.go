@@ -56,16 +56,51 @@ type Receiver struct {
 	resend      *resendRequester
 }
 
-// Listen binds the RTSP port. Passing port 0 lets the OS choose, which is what
-// multi-zone wants: the real port goes out in the mDNS SRV record, so nothing
-// needs a fixed number and three zones cannot collide.
+// Listen binds the RTSP port, preferring a stable one derived from the zone's
+// identity and falling back to whatever the OS will give.
+//
+// The port must not move between restarts. Senders cache the mDNS SRV record,
+// so a zone that comes back on a different port is dialled at the old one and
+// the connection fails with nothing arriving here at all -- which looks, from
+// the outside, exactly like the sender refusing to connect. An ephemeral port
+// was chosen originally to avoid collisions between zones and worked fine
+// until the daemon had been restarted enough times for a sender's cache to go
+// stale, at which point one zone stopped working while the others kept going
+// purely by luck.
+//
+// Deriving the port from the coordinator UUID gives each zone the same number
+// on every run, on any host, with no state to persist.
 func (r *Receiver) Listen(port int) (int, error) {
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
-		return 0, err
+		// Something else holds it. An ephemeral port still works for this
+		// run; it only costs us cache stability, which beats not starting.
+		ln, err = net.Listen("tcp", ":0")
+		if err != nil {
+			return 0, err
+		}
 	}
 	r.ln = ln
 	return ln.Addr().(*net.TCPAddr).Port, nil
+}
+
+// StablePort maps a zone key to a repeatable port in the dynamic range.
+//
+// FNV-1a rather than anything cryptographic: this needs to be deterministic
+// and well spread, not unpredictable. The range avoids both privileged ports
+// and the ephemeral range most kernels allocate from, so a stable port is
+// unlikely to collide with something the OS hands out to another process.
+func StablePort(key string) int {
+	const (
+		base = 40000
+		span = 5000
+	)
+	var h uint32 = 2166136261
+	for i := 0; i < len(key); i++ {
+		h ^= uint32(key[i])
+		h *= 16777619
+	}
+	return base + int(h%span)
 }
 
 // Serve accepts RTSP sessions until the listener is closed.
