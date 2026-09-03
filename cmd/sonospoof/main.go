@@ -118,6 +118,25 @@ func main() {
 		}
 	}()
 
+	// If the ids have been salted, tell the network to forget the unsalted
+	// ones. Without this they linger in senders' caches as a duplicate entry
+	// pointing at a device that no longer answers, and no amount of restarting
+	// clears it -- the old service was never withdrawn, only abandoned.
+	if bridge.IDSalt != 0 {
+		var retired []bridge.RetiredZone
+		for _, z := range zones {
+			retired = append(retired, bridge.RetiredZone{
+				Name: z.Name,
+				ID:   z.RAOPID, // deliberately unsalted
+				Port: raop.StablePort(z.CoordinatorUUID),
+			})
+		}
+		go func() {
+			adv.Retire(ctx, retired)
+			log.Printf("retired %d pre-salt identities", len(retired))
+		}()
+	}
+
 	log.Printf("streaming from http://%s/ -- %d target(s) advertised", streamHost, len(bridges))
 
 	sig := make(chan os.Signal, 1)

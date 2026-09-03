@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"time"
 
 	"github.com/brutella/dnssd"
 )
@@ -95,6 +96,64 @@ func (a *Advertiser) Add(name string, id net.HardwareAddr, port int) error {
 // Run serves mDNS until ctx is cancelled.
 func (a *Advertiser) Run(ctx context.Context) error {
 	return a.responder.Respond(ctx)
+}
+
+// Retire announces the pre-salt identities and immediately withdraws them, so
+// the mDNS goodbye tells every client to forget them.
+//
+// Changing IDSalt leaves the previous identity in senders' caches, where it
+// shows up as a duplicate entry in the AirPlay picker pointing at a device
+// that no longer exists. Restarting the daemon does not clear it: the old
+// service is never withdrawn, it simply stops being announced, and clients
+// hold what they last saw until it ages out. A goodbye purges it at once and
+// everywhere, rather than asking each user to reset their own machine.
+//
+// Cheap and idempotent: with no salt there is nothing to retire.
+func (a *Advertiser) Retire(ctx context.Context, zones []RetiredZone) {
+	if IDSalt == 0 || len(zones) == 0 {
+		return
+	}
+	var handles []dnssd.ServiceHandle
+	for _, z := range zones {
+		if z.ID == nil {
+			continue
+		}
+		hex := strings.ToUpper(strings.ReplaceAll(z.ID.String(), ":", ""))
+		cfg := dnssd.Config{
+			Name:   hex + "@" + z.Name,
+			Type:   "_raop._tcp",
+			Domain: "local",
+			Port:   z.Port,
+		}
+		if a.iface != "" {
+			cfg.Ifaces = []string{a.iface}
+		}
+		svc, err := dnssd.NewService(cfg)
+		if err != nil {
+			continue
+		}
+		h, err := a.responder.Add(svc)
+		if err != nil {
+			continue
+		}
+		handles = append(handles, h)
+	}
+	if len(handles) == 0 {
+		return
+	}
+	// Give the responder a moment to announce before withdrawing; a goodbye
+	// for something never announced teaches listeners nothing.
+	time.Sleep(2 * time.Second)
+	for _, h := range handles {
+		a.responder.Remove(h)
+	}
+}
+
+// RetiredZone names an identity that should be withdrawn from the network.
+type RetiredZone struct {
+	Name string
+	ID   net.HardwareAddr
+	Port int
 }
 
 // txtRecords is the feature advertisement. These bits are the single most
