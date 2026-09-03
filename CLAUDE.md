@@ -52,8 +52,26 @@ per VLAN.
 The M0 probes are gone — deleted once M1 landed, as planned.
 
 Deployed and running: unprivileged Proxmox LXC 310 (`sonospoof`) on the IoT
-VLAN. See `deploy/`. Playback is clean: three minutes with zero gaps, verified
-by capturing the served PCM, not by ear alone.
+VLAN, at 192.168.30.60. See `deploy/`. Playback is clean — an 18-minute
+session with zero starvation events across 140k packets, verified by capturing
+the served PCM rather than by ear alone.
+
+**The running container diverges from what `install-lxc.sh` produces**, in two
+ways, both deliberate and both worth knowing before debugging it:
+
+- `-id-salt 1` is in its systemd unit. A Mac had blacklisted one zone's
+  identity internally and would not emit a packet for it however much was
+  reset; salting the id made it a device with no history and it connected at
+  once. This is not a default because it should only be set when a sender is
+  genuinely stuck. If it happens again, bump to 2.
+- `-wait 6s`, because one SSDP sweep missed a speaker that was mid-reboot.
+
+The Proxmox host also carries a hand-made `vmbr30` bridge over an `iot30`
+sub-interface, which the installer documents but does not create. If that host
+is rebuilt, `/etc/network/interfaces` needs it again; backups are on the host
+as `.bak.*`. The interface is named `iot30` rather than the conventional
+`<parent>.30` because this host's NIC is `enx9c69d3309b9a` and the derived
+name would exceed the kernel's 15-character limit.
 
 ## M0 findings
 
@@ -220,6 +238,26 @@ Each of these was reasoned out during design; they are not speculative.
   the Sonos app drops the AirPlay session instead of fighting over it.
 - **mDNS TXT feature bits are the most likely thing to be wrong** in the whole
   project. When a device is invisible or refuses to connect, suspect them first.
+- **Never bind an ephemeral RTSP port.** Senders cache the mDNS SRV record, so
+  a port that moves on restart means the sender dials a dead one and reports
+  that it cannot connect, with nothing arriving here at all. That looks
+  identical to the sender refusing to try. Ports come from `StablePort`, keyed
+  on the coordinator UUID. This cost an evening: one zone broke while the
+  others kept working purely because their cached ports still matched.
+- **A sender can blacklist a device and stay that way.** macOS was seen
+  resolving a zone correctly, with the listener answering a hand-rolled RTSP
+  OPTIONS from that same machine, and never emitting a SYN for it. Flushing
+  mDNS, restarting ControlCenter and coreaudiod, and power-cycling the speaker
+  all changed nothing, because the decision happens before any packet is sent.
+  `-id-salt` presents a fresh identity and is the only lever; the daemon sends
+  mDNS goodbyes for the retired ids so the old entry does not linger.
+- **Validate the instrument before trusting an empty capture.** `timeout` plus
+  `tcpdump -w` yields an empty pcap, because the SIGTERM kills tcpdump before
+  it flushes; `-i any` on a Proxmox host does not see bridged traffic; and the
+  container has no tcpdump. Four captures in a row "proved" there was no
+  traffic while a session was demonstrably streaming. Capture on `vmbr30`,
+  print to stdout rather than `-w`, and confirm the known-good case appears in
+  the same file before drawing any conclusion from an absence.
 - **iOS connects over IPv6 link-local**, not IPv4 — observed throughout M0
   (`fe80::…%en0`). Two consequences. The Apple-Response signs
   `challenge || localIP || mac`, and over IPv6 that block is 38 bytes and is
